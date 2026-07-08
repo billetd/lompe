@@ -389,12 +389,12 @@ class Emodel(object):
                         self._d = np.hstack((self._d, np.hstack(ds.values)))
                         self._w = np.hstack((self._w, w_i))
 
-                    GTG_i = G.T.dot(np.diag(w_i)).dot(G)
-                    GTd_i = G.T.dot(np.diag(w_i)).dot(np.hstack(ds.values))
-                    
+                    GTG_i = G.T.dot(G * w_i.reshape((-1, 1)))
+                    GTd_i = G.T.dot(w_i * np.hstack(ds.values))
+
                     GTGs.append(GTG_i)
                     GTds.append(GTd_i)
-                    ii += 1         
+                    ii += 1
 
         self.GTG = np.sum(np.array(GTGs), axis=0)
         self.GTd = np.sum(np.array(GTds), axis=0)
@@ -402,7 +402,7 @@ class Emodel(object):
         # Reguarlization
         if not FAC_reg and (isinstance(l1, tuple) or isinstance(l2, tuple) or isinstance(l3, tuple)):
             raise ValueError('l1, l2, and l3 can only be tuple if FAC_reg=True')
-        
+
         def reg_E(self, l1, l2, l3):
             """Calculate the roughening matrix for E (normal) regularization"""
             LTL = 0
@@ -414,7 +414,7 @@ class Emodel(object):
             if l3 > 0:
                 LTL += l3 * self.LTLn / np.median(self.LTLn.diagonal())
             return LTL
-        
+
         def reg_FAC(self, l1, l2, l3):
             """Calculate the roughening matrix for FAC regularization"""
             G_FAC = self.FAC_matrix()
@@ -431,7 +431,7 @@ class Emodel(object):
                 LTL_l3 = G_FAC_n.T.dot(G_FAC_n)
                 LTL += l3 * LTL_l3 / np.median(LTL_l3.diagonal())
             return LTL
-        
+
         def ensure_tuple(value):
             """Ensure the value is a tuple of length 2."""
             if isinstance(value, tuple):
@@ -439,7 +439,7 @@ class Emodel(object):
                     raise ValueError(f"Tuple {value} must have length 2.")
                 return value
             return (value, 0)
-        
+
         if not FAC_reg:
             LTL = reg_E(self, l1, l2, l3)
         elif FAC_reg and  any(isinstance(x, tuple) for x in (l1, l2, l3)):
@@ -452,31 +452,36 @@ class Emodel(object):
             LTL = reg_FAC(self, l1, l2, l3)
         else:
             LTL = 0
-        
+
         gtg_mag = np.median(np.diagonal(self.GTG))
         GG = self.GTG + LTL*gtg_mag
-            
+
         if 'rcond' in kwargs.keys():
             warnings.warn("'rcond' keyword (and use of np.linalg.lstsq) is deprecated! Use kw 'cond' (for scipy.linalg.lstsq) instead")
             kwargs['cond'] = kwargs['rcond']
         if 'cond' not in kwargs.keys():
             kwargs['cond'] = None
-        
+
         if 'lapack_driver' not in kwargs.keys():
             kwargs['lapack_driver'] = 'gelsd'
 
-        self.Cmpost = scipy.linalg.lstsq(GG, np.eye(GG.shape[0]), **kwargs)[0]
+        try:
+            c, lower = scipy.linalg.cho_factor(GG, lower=True)
+            self.Cmpost = scipy.linalg.cho_solve((c, lower), np.eye(GG.shape[0]))
+        except scipy.linalg.LinAlgError:
+            warnings.warn(...)
+            self.Cmpost = scipy.linalg.lstsq(GG, np.eye(GG.shape[0]), **kwargs)[0]
         self.Rmatrix = self.Cmpost.dot(self.GTG)
         self.m = self.Cmpost.dot(self.GTd)
 
         return (self.GTG, self.GTd)
 
     def calc_resolution(self, innerGrid=True):
-        
+
         '''
         Calculate spatial resolution following Madelaire et al. [2023]
         '''
-        
+
         # Get res in km
         colatxi = 90 - self.grid_E.lat
         lonxi = self.grid_E.lon
@@ -488,25 +493,25 @@ class Emodel(object):
 
         euclidxi = np.median(np.sqrt(np.diff(xxi, axis=1)**2 + np.diff(yxi, axis=1)**2 + np.diff(zxi,axis=1)**2))
         euclideta = np.median(np.sqrt(np.diff(xxi, axis=0)**2 + np.diff(yxi, axis=0)**2 + np.diff(zxi,axis=0)**2))
-        
+
         # Left right function
         def left_right(PSF_i, fraq=0.5):
-        
-            i_max = np.argmax(PSF_i)    
+
+            i_max = np.argmax(PSF_i)
             PSF_max = PSF_i[i_max]
-            
+
             j = 0
             i_left = 0
             left_edge = True
             while (i_max - j) >= 0:
                 if PSF_i[i_max - j] < fraq*PSF_max:
-                
+
                     dPSF = PSF_i[i_max - j + 1] - PSF_i[i_max - j]
                     dx = (fraq*PSF_max - PSF_i[i_max - j]) / dPSF
                     i_left = i_max - j + dx
-                
+
                     left_edge = False
-                
+
                     break
                 else:
                     j += 1
@@ -516,17 +521,17 @@ class Emodel(object):
             right_edge = True
             while (i_max + j) < len(PSF_i):
                 if PSF_i[i_max + j] < fraq*PSF_max:
-                
+
                     dPSF = PSF_i[i_max + j] - PSF_i[i_max + j - 1]
                     dx = (fraq*PSF_max - PSF_i[i_max + j - 1]) / dPSF
-                    i_right = i_max + j - 1 + dx 
-                
+                    i_right = i_max + j - 1 + dx
+
                     right_edge = False
-                
+
                     break
                 else:
                     j += 1
-        
+
             flag = True
             if left_edge and right_edge:
                 print('I think something is wrong')
@@ -537,33 +542,33 @@ class Emodel(object):
             elif right_edge:
                 i_right = i_max + (i_max - i_left)
                 flag = False
-        
+
             return i_left, i_right, i_max, flag
-        
+
         # Allocate space
         xiRes = np.zeros(self.grid_E.shape)
         etaRes = np.zeros(self.grid_E.shape)
         xiResFlag = np.zeros(self.grid_E.shape)
         etaResFlag = np.zeros(self.grid_E.shape)
         resL = np.zeros(self.grid_E.shape)
-        
+
         # Loop over all PSFs
         for i in range(xiRes.size):
-                        
+
             row = i//xiRes.shape[1]
             col = i%xiRes.shape[1]
-            
+
             PSF = abs(self.Rmatrix[:, i]).reshape(self.grid_E.shape)
-            
+
             ii = np.argmax(PSF)
             rowPSF = ii//self.grid_E.shape[1]
             colPSF = ii%self.grid_E.shape[1]
-            
+
             dxi = abs(colPSF - col) * euclidxi
             deta = abs(rowPSF - row) * euclideta
-            
+
             resL[row, col] = np.sqrt(dxi**2 + deta**2)
-            
+
             PSF_xi = np.sum(PSF, axis=0)
             if innerGrid:
                 PSF_xi[0] = 0.99*np.max(PSF_xi[1:-1])
@@ -571,7 +576,7 @@ class Emodel(object):
             i_left, i_right, i_max, flag = left_right(PSF_xi)
             xiRes[row, col] = euclidxi * (i_right - i_left)
             xiResFlag[row, col] = flag
-            
+
             PSF_eta = np.sum(PSF, axis=1)
             if innerGrid:
                 PSF_eta[0] = 0.99*np.max(PSF_eta[1:-1])
@@ -579,13 +584,13 @@ class Emodel(object):
             i_left, i_right, i_max, flag = left_right(PSF_eta)
             etaRes[row, col] = euclideta * (i_right - i_left)
             etaResFlag[row, col] = flag
-        
+
         if innerGrid:
             xiResFlag[:, [0, -1]] = 0
             xiResFlag[[0, -1], :] = 0
-            etaResFlag[:, [0, -1]] = 0            
+            etaResFlag[:, [0, -1]] = 0
             etaResFlag[[0, -1], :] = 0
-        
+
         self.xiRes = xiRes
         self.etaRes = etaRes
         self.xiResFlag = xiResFlag
@@ -835,7 +840,7 @@ class Emodel(object):
     @check_input
     def _B_cf_df_matrix(self, lon = None, lat = None, r = None, return_shape = False):
         """
-        Calculate matrix that relates magnetic fields of both curl-free and 
+        Calculate matrix that relates magnetic fields of both curl-free and
         divergence-free currents to model vector.
 
         Not intended to be called by user in standard use case
@@ -1098,6 +1103,41 @@ class Emodel(object):
 
 
     @check_input
+    def equivalent_current_function(self, lon = None, lat = None):
+        """
+        Calculate the equivalent current function psi, where j_equivalent_current = u_hat cross grad(psi)
+
+        Requires the model vector to be defined.
+
+        Parameters
+        ----------
+        lon : array, optional
+            Longitudes [degrees] of the evaluation points, default is center of exterior grid points (grid_E).
+            Must have same shape as lat
+        lat : array, optional
+            Latitudes [degrees] of the evaluation points, default is center of exterior grid points (grid_E).
+            Must have same shape as lon
+
+        Returns
+        -------
+        psi : array
+            Equivalent current function, unit A/m
+
+        Note
+        ----
+        psi is calculated by evaluating the SECS G matrix for a potential, with a sign reversal
+
+        """
+
+        shape = np.broadcast(lon, lat).shape
+
+        S_df = self._B_df_matrix(return_poles = True)
+        G_psi = -get_SECS_J_G_matrices(lat, lon, self.lat_J, self.lon_J, current_type = 'potential', RI = self.R, singularity_limit = self.secs_singularity_limit)
+
+        return G_psi.dot(S_df)
+
+
+    @check_input
     def get_SECS_currents(self, lon = None, lat = None):
         """
         Calculate the horizontal ionospheric surface current density,
@@ -1143,4 +1183,3 @@ class Emodel(object):
                                              singularity_limit = self.secs_singularity_limit)
 
         return Be_cf.dot(S_cf) + Be_df.dot(S_df), Bn_cf.dot(S_cf) + Bn_df.dot(S_df)
-
