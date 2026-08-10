@@ -186,6 +186,25 @@ class Emodel(object):
         return Le, Ln, LTLe, LTLn
 
 
+    def prepare_biggrid(self, perimeter_width = 10):
+        """ Build and cache the expanded grid used for data density weighting
+
+        run_inversion() does this lazily on its first call. Doing it up front is
+        useful when the model object is shipped to parallel workers, so that every
+        worker inherits the grid instead of rebuilding it.
+
+        parameters
+        ----------
+        perimeter_width: int, optional
+            Must match the value later passed to run_inversion(). Default 10.
+        """
+        self.biggrid = cs.CSgrid(self.grid_J.projection,
+                                 self.grid_J.L + 2 * perimeter_width * self.grid_J.Lres, self.grid_J.W + 2 * perimeter_width * self.grid_J.Wres,
+                                 self.grid_J.Lres, self.grid_J.Wres,
+                                 R = self.R )
+        self._biggrid_perimeter_width = perimeter_width
+        return self.biggrid
+
     def clear_model(self, Hall_Pedersen_conductance = None):
         """ Reset data and model vectors
 
@@ -283,7 +302,7 @@ class Emodel(object):
         
     def run_inversion(self, l1 = 0, l2 = 0, l3 = 0, FAC_reg=False,
                       data_density_weight = True, perimeter_width = 10, save_matrices=False,
-                      **kwargs):
+                      posterior=False, **kwargs):
         """ Calculate model vector
 
         Uses all the data that has been added to solve full system of
@@ -314,6 +333,14 @@ class Emodel(object):
             grid will be included. 
         save_matrices : bool, optional
             Set to True to save G, d, and w in the lompe model object.
+        posterior : bool, optional
+            Set to True to also compute the posterior model covariance matrix
+            (Cmpost) and the model resolution matrix (Rmatrix). These require an
+            explicit inverse of the regularized system and cost roughly an order of
+            magnitude more than the model vector itself, so the default is False.
+            They are needed by calc_resolution() and by the resolution/uncertainty
+            plotting routines in lompe.model.visualization; everything that only uses
+            the model vector (E, E_pot, v, j, FAC, ...) works without them.
 
         **kwargs : dict
             key arguments to be passed to the scipy.linalg.lstsq (e.g., 'cond', 'lapack_driver').
@@ -327,11 +354,15 @@ class Emodel(object):
             self._w = np.empty( 0)
 
         # make expanded grid for calculation of data density:
-        self.biggrid = cs.CSgrid(self.grid_J.projection,
-                                 self.grid_J.L + 2 * perimeter_width * self.grid_J.Lres, self.grid_J.W + 2 * perimeter_width * self.grid_J.Wres,
-                                 self.grid_J.Lres, self.grid_J.Wres,
-                                 R = self.R )
-        
+        # this depends only on grid_J and perimeter_width, so it is cached across calls
+        if getattr(self, 'biggrid', None) is None or self._biggrid_perimeter_width != perimeter_width:
+            self.biggrid = cs.CSgrid(self.grid_J.projection,
+                                     self.grid_J.L + 2 * perimeter_width * self.grid_J.Lres, self.grid_J.W + 2 * perimeter_width * self.grid_J.Wres,
+                                     self.grid_J.Lres, self.grid_J.Wres,
+                                     R = self.R )
+            self._biggrid_perimeter_width = perimeter_width
+
+
         GTGs = []
         GTds = []
 
@@ -465,14 +496,29 @@ class Emodel(object):
         if 'lapack_driver' not in kwargs.keys():
             kwargs['lapack_driver'] = 'gelsd'
 
+        # Solving for the posterior model covariance requires an explicit inverse of GG
+        # (~2N^3), and Rmatrix another ~2N^3 on top of that. When they are not needed,
+        # m can be obtained straight from the Cholesky factors for ~N^2.
         try:
             c, lower = scipy.linalg.cho_factor(GG, lower=True)
-            self.Cmpost = scipy.linalg.cho_solve((c, lower), np.eye(GG.shape[0]))
+            if posterior:
+                self.Cmpost = scipy.linalg.cho_solve((c, lower), np.eye(GG.shape[0]))
+            else:
+                self.Cmpost = None
+                self.m = scipy.linalg.cho_solve((c, lower), self.GTd)
         except scipy.linalg.LinAlgError:
-            warnings.warn(...)
-            self.Cmpost = scipy.linalg.lstsq(GG, np.eye(GG.shape[0]), **kwargs)[0]
-        self.Rmatrix = self.Cmpost.dot(self.GTG)
-        self.m = self.Cmpost.dot(self.GTd)
+            warnings.warn('Cholesky factorization failed, falling back to scipy.linalg.lstsq')
+            if posterior:
+                self.Cmpost = scipy.linalg.lstsq(GG, np.eye(GG.shape[0]), **kwargs)[0]
+            else:
+                self.Cmpost = None
+                self.m = scipy.linalg.lstsq(GG, self.GTd, **kwargs)[0]
+
+        if posterior:
+            self.Rmatrix = self.Cmpost.dot(self.GTG)
+            self.m = self.Cmpost.dot(self.GTd)
+        else:
+            self.Rmatrix = None
 
         return (self.GTG, self.GTd)
 
@@ -481,6 +527,10 @@ class Emodel(object):
         '''
         Calculate spatial resolution following Madelaire et al. [2023]
         '''
+
+        if getattr(self, 'Rmatrix', None) is None:
+            raise Exception('Model resolution matrix not available. '
+                            'Call run_inversion(..., posterior=True) first.')
 
         # Get res in km
         colatxi = 90 - self.grid_E.lat
